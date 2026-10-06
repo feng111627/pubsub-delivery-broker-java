@@ -1,0 +1,44 @@
+package com.github.feng111627.pubsubdeliverybrokerjava.dlq;
+
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 死信台账：所有"无法再靠重投完成"的消息都必须在此可查，绝不凭空消失。
+ *
+ * 进入死信的两种情形：
+ * <ol>
+ *   <li>{@code MAX_DELIVERIES_EXCEEDED}：ACK 超时且投递次数达到上限。</li>
+ *   <li>{@code PENDING_OVERFLOW}：订阅端在途积压超过 {@code broker.max-pending-per-subscription}，
+ *       按配置策略把最旧的未完成消息移出投递路径。</li>
+ * </ol>
+ */
+@Component
+public class DeadLetterQueue {
+
+    private final List<DeadLetter> letters = new ArrayList<>();
+
+    public synchronized void record(DeadLetter letter) {
+        letters.add(letter);
+    }
+
+    public synchronized List<DeadLetter> listByClient(String clientId) {
+        List<DeadLetter> out = new ArrayList<>();
+        for (DeadLetter l : letters) {
+            if (l.clientId().equals(clientId)) {
+                out.add(l);
+            }
+        }
+        return out;
+    }
+
+    public synchronized List<DeadLetter> listAll() {
+        return new ArrayList<>(letters);
+    }
+
+    public synchronized int size() {
+        return letters.size();
+    }
+}
