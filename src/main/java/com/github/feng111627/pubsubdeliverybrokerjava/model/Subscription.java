@@ -79,6 +79,19 @@ public class Subscription {
         deadSeqs.add(seq);
     }
 
+    /**
+     * 死信再投递：把一条已死信的消息重新放回在途集合，按新一轮投递周期处理
+     * （attempt 从 1 重新计），并排入待重投队列让下一次 poll 优先投出。
+     * 消息保持原 globalSeq/messageId，deliveredSeq 游标只增不减、不会回退。
+     */
+    public void revive(BrokerMessage msg, long now) {
+        long seq = msg.globalSeq();
+        deadSeqs.remove(seq);
+        PendingDelivery pd = new PendingDelivery(msg, 1, now);
+        pd.markQueuedForRedelivery();
+        pending.put(seq, pd);
+    }
+
     public boolean isAcked(long seq) { return ackedSeqs.contains(seq); }
     public boolean isDead(long seq) { return deadSeqs.contains(seq); }
     public boolean isPending(long seq) { return pending.containsKey(seq); }

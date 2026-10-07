@@ -16,6 +16,7 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleApi(ApiException ex) {
         HttpStatus status = switch (ex.getErrorCode()) {
             case "SUBSCRIPTION_CONFLICT" -> HttpStatus.CONFLICT;
+            case "PENDING_FULL" -> HttpStatus.TOO_MANY_REQUESTS;
             default -> HttpStatus.BAD_REQUEST;
         };
         return ResponseEntity.status(status)

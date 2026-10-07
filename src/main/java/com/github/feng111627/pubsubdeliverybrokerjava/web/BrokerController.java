@@ -42,6 +42,20 @@ public class BrokerController {
         return ResponseEntity.noContent().build();
     }
 
+    @PostMapping("/subscriptions/{clientId}/extend")
+    public ResponseEntity<ExtendResult> extend(@PathVariable String clientId,
+                                               @RequestBody ExtendRequest request) {
+        return ResponseEntity.ok(
+                brokerService.extend(clientId, request.messageId(), request.extendMs()));
+    }
+
+    @PostMapping("/dead-letters/redeliver")
+    public ResponseEntity<RedeliverResult> redeliverDeadLetters(
+            @RequestBody RedeliverDeadLettersRequest request) {
+        return ResponseEntity.ok(
+                brokerService.redeliverDeadLetters(request.clientId(), request.messageIds()));
+    }
+
     @GetMapping("/dead-letters")
     public ResponseEntity<List<DeadLetter>> deadLetters(@RequestParam(required = false) String clientId) {
         return ResponseEntity.ok(brokerService.deadLetters(clientId));

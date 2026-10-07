@@ -19,8 +19,11 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Broker 核心编排。
@@ -118,7 +121,7 @@ public class BrokerService {
             dlq.record(new DeadLetter(sub.getClientId(), evicted.getMessage().id(),
                     evicted.getMessage().topic(),
                     REASON_OVERFLOW + ":drop-oldest(attempts=" + evicted.getAttempt() + ")",
-                    now));
+                    now, 0));
             sub.registerPending(msg, now);
             log.warn("订阅端 {} 积压超限，按 drop-oldest 将最旧消息 {} 移入死信，接收新消息 {}",
                     sub.getClientId(), evicted.getMessage().id(), msg.id());
@@ -128,7 +131,7 @@ public class BrokerService {
         sub.markDead(msg.globalSeq());
         dlq.record(new DeadLetter(sub.getClientId(), msg.id(), msg.topic(),
                 REASON_OVERFLOW + ":dead-letter(pending=" + sub.getPending().size()
-                        + ", limit=" + props.getMaxPendingPerSubscription() + ")", now));
+                        + ", limit=" + props.getMaxPendingPerSubscription() + ")", now, 0));
         log.warn("订阅端 {} 积压超限，按 dead-letter 拒绝新消息 {} 并入死信",
                 sub.getClientId(), msg.id());
         return true;
@@ -166,18 +169,23 @@ public class BrokerService {
         long now = System.currentTimeMillis();
         List<DeliveryView> views = new ArrayList<>();
         synchronized (lock) {
-            // 1) 优先投递"待重投"的在途消息（保持全局序号升序）
-            for (PendingDelivery pd : new ArrayList<>(sub.getPending().values())) {
-                if (views.size() >= batch) {
+            // 1) 优先投递"待重投"的在途消息（保持全局序号升序）。
+            //    注意此处只收集不清标记：attempt=1 的捞回消息也带待重投标记，
+            //    若先清标记，第二轮会把它再次当成首次投递重复发出。
+            List<PendingDelivery> due = new ArrayList<>();
+            for (PendingDelivery pd : sub.getPending().values()) {
+                if (due.size() >= batch) {
                     break;
                 }
                 if (pd.isDueForRedelivery()) {
-                    pd.clearRedeliveryFlag();
-                    views.add(toView(pd));
+                    due.add(pd);
                 }
             }
-            // 2) 首次投递剩余的新在途消息，按序号升序
-            for (PendingDelivery pd : new ArrayList<>(sub.getPending().values())) {
+            for (PendingDelivery pd : due) {
+                views.add(toView(pd));
+            }
+            // 2) 首次投递剩余的新在途消息，按序号升序（跳过仍带待重投标记的）
+            for (PendingDelivery pd : sub.getPending().values()) {
                 if (views.size() >= batch) {
                     break;
                 }
@@ -189,6 +197,7 @@ public class BrokerService {
             for (DeliveryView v : views) {
                 PendingDelivery pd = sub.getPending(v.seq());
                 if (pd != null) {
+                    pd.clearRedeliveryFlag();
                     pd.markSentAt(now);
                 }
             }
@@ -262,8 +271,9 @@ public class BrokerService {
         synchronized (lock) {
             for (Subscription sub : subscriptions.all()) {
                 for (PendingDelivery pd : new ArrayList<>(sub.getPending().values())) {
-                    // 客户端尚未拉取过的消息不参与超时，避免"未投递先重投"
-                    if (!pd.isDelivered() || now - pd.getLastSentAt() < timeout) {
+                    // 客户端尚未拉取过的消息不参与超时，避免"未投递先重投"；
+                    // 续期会把到点往后推，续期窗口未到期前不得误判超时
+                    if (!pd.isDelivered() || now < pd.effectiveDeadline(timeout)) {
                         continue;
                     }
                     BrokerMessage msg = pd.getMessage();
@@ -272,7 +282,7 @@ public class BrokerService {
                         dlq.record(new DeadLetter(sub.getClientId(), msg.id(), msg.topic(),
                                 REASON_MAX_DELIVERIES + "(attempts=" + pd.getAttempt()
                                         + ", timeoutMs=" + timeout + ")",
-                                now));
+                                now, 0));
                         processed++;
                         log.warn("消息 {} 对订阅端 {} 投递 {} 次仍未 ACK，转入死信",
                                 msg.id(), sub.getClientId(), pd.getAttempt());
@@ -292,5 +302,167 @@ public class BrokerService {
         return clientId == null || clientId.isBlank()
                 ? dlq.listAll()
                 : dlq.listByClient(clientId);
+    }
+
+    // ------------------------------------------------------- 投递续期
+
+    /**
+     * 投递续期：消费者在本次确认超时到点前申请把超时往后延。
+     *
+     * <p>只延长在途消息的超时到点，不等于确认、不改变投递次数、不影响消费进度。
+     * 续期窗口到期后仍未 ACK 的，按原规则进入重投/死信流程。</p>
+     *
+     * <p>明确报错的情形：消息已确认（ALREADY_ACKED）、已进死信（DEAD_LETTERED）、
+     * 从未投递给该订阅端或消息不存在（MESSAGE_NOT_FOUND）、续期时长非法（INVALID_EXTENSION）。</p>
+     */
+    public ExtendResult extend(String clientId, String messageId, Long extendMs) {
+        if (messageId == null || messageId.isBlank()) {
+            throw new InvalidSubscriptionException("extend.messageId 不能为空");
+        }
+        long ms = extendMs == null ? props.getAckTimeoutMs() : extendMs;
+        if (ms <= 0 || ms > props.getMaxExtendMs()) {
+            throw new ApiException("INVALID_EXTENSION",
+                    "续期时长必须为正且不超过 broker.max-extend-ms=" + props.getMaxExtendMs()
+                            + ": clientId=" + clientId + ", messageId=" + messageId
+                            + ", extendMs=" + ms);
+        }
+        Subscription sub = subscriptions.get(clientId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "订阅端不存在: clientId=" + clientId + "，请先调用 /api/subscribe"));
+        BrokerMessage msg = messages.find(messageId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "消息不存在: messageId=" + messageId));
+        long seq = msg.globalSeq();
+        synchronized (lock) {
+            // 顺序敏感：在途 -> 已确认 -> 已死信 -> 从未投递给该订阅端（与 ACK 校验口径一致）
+            PendingDelivery pd = sub.getPending(seq);
+            if (pd != null) {
+                long now = System.currentTimeMillis();
+                pd.extend(now, ms);
+                log.info("续期成功 clientId={} messageId={} seq={} 延长 {}ms，新到点={}",
+                        clientId, messageId, seq, ms, pd.getExtendedUntil());
+                return new ExtendResult(messageId, seq, pd.getExtendedUntil());
+            }
+            if (sub.isAcked(seq)) {
+                throw new AlreadyAckedException(
+                        "消息已经确认过，无需也无法续期: clientId=" + clientId
+                                + ", messageId=" + messageId + ", seq=" + seq);
+            }
+            if (sub.isDead(seq)) {
+                throw new ApiException("DEAD_LETTERED",
+                        "消息已进入死信，不能续期；如需重新消费请走死信再投递: clientId=" + clientId
+                                + ", messageId=" + messageId);
+            }
+            throw new MessageNotFoundException(
+                    "该消息从未投递给此订阅端（可能主题不匹配或订阅晚于发布），无法续期: clientId="
+                            + clientId + ", messageId=" + messageId + ", topic=" + msg.topic());
+        }
+    }
+
+    // ------------------------------------------------------- 死信再投递
+
+    /**
+     * 死信再投递：把死信台账中尚未被消费掉的消息重新投给对应订阅端。
+     *
+     * <p>语义与边界：</p>
+     * <ul>
+     *   <li>整批先校验后执行（原子）：任一消息不存在/已确认/不在死信中，整批拒绝并说明原因；</li>
+     *   <li>本批实际捞回的消息按全局序号（即发布先后）升序重新进入在途集合，
+     *       下一次 poll 按既有"重投优先、序号升序"规则投出，相对顺序稳定；</li>
+     *   <li>幂等：同一批重复触发时，已捞回的消息报告 ALREADY_REDELIVERED，
+     *       不重复入队、不产生重复投递；</li>
+     *   <li>容量：捞回后若在途总数会超过 broker.max-pending-per-subscription，
+     *       整批拒绝（PENDING_FULL），绝不悄悄丢消息；</li>
+     *   <li>捞回的消息开启新一轮投递周期（attempt 从 1 重计），messageId/seq 不变，
+     *       消费进度游标不回退。</li>
+     * </ul>
+     */
+    public RedeliverResult redeliverDeadLetters(String clientId, List<String> messageIds) {
+        if (messageIds == null || messageIds.isEmpty()) {
+            throw new ApiException("INVALID_REQUEST",
+                    "messageIds 不能为空：请至少指定一条要再投递的死信消息");
+        }
+        Subscription sub = subscriptions.get(clientId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "订阅端不存在: clientId=" + clientId + "，请先调用 /api/subscribe"));
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            // 1) 逐条校验并分类（请求内重复的 messageId 只处理一次）
+            Map<String, Long> seqById = new LinkedHashMap<>();
+            Map<String, String> statusById = new LinkedHashMap<>();
+            List<BrokerMessage> toRevive = new ArrayList<>();
+            for (String id : messageIds) {
+                if (id == null || id.isBlank()) {
+                    throw new ApiException("INVALID_REQUEST",
+                            "messageIds 中不允许出现空 messageId: clientId=" + clientId);
+                }
+                if (statusById.containsKey(id)) {
+                    continue;
+                }
+                BrokerMessage msg = messages.find(id)
+                        .orElseThrow(() -> new MessageNotFoundException(
+                                "消息不存在，无法再投递: clientId=" + clientId + ", messageId=" + id));
+                long seq = msg.globalSeq();
+                seqById.put(id, seq);
+                if (sub.isAcked(seq)) {
+                    throw new AlreadyAckedException(
+                            "消息已被该订阅端确认消费，不能从死信再投递: clientId=" + clientId
+                                    + ", messageId=" + id + ", seq=" + seq);
+                }
+                Optional<DeadLetter> letter = dlq.find(clientId, id);
+                if (letter.isEmpty()) {
+                    if (sub.isPending(seq)) {
+                        throw new ApiException("NOT_DEAD_LETTERED",
+                                "消息正在投递途中，不在死信台账中，无需再投递: clientId=" + clientId
+                                        + ", messageId=" + id + ", seq=" + seq);
+                    }
+                    throw new MessageNotFoundException(
+                            "该消息从未投递给此订阅端，也不在死信台账中: clientId=" + clientId
+                                    + ", messageId=" + id + ", topic=" + msg.topic());
+                }
+                if (letter.get().redelivered()) {
+                    // 幂等：之前已捞回，本次不再重复入队
+                    statusById.put(id, "ALREADY_REDELIVERED");
+                } else {
+                    statusById.put(id, "REDELIVERED");
+                    toRevive.add(msg);
+                }
+            }
+            // 2) 容量检查：宁可整批明确拒绝，也不悄悄丢消息
+            int pendingAfter = sub.getPending().size() + toRevive.size();
+            if (pendingAfter > props.getMaxPendingPerSubscription()) {
+                throw new ApiException("PENDING_FULL",
+                        "再投递后订阅端在途消息将达 " + pendingAfter
+                                + "，超过上限 broker.max-pending-per-subscription="
+                                + props.getMaxPendingPerSubscription()
+                                + "（当前在途 " + sub.getPending().size() + "，本批待捞回 "
+                                + toRevive.size() + "）；请先消费/确认部分在途消息或缩小批量后重试"
+                                + ": clientId=" + clientId);
+            }
+            // 3) 按发布先后（全局序号升序）捞回，保证批内相对顺序稳定
+            toRevive.sort(Comparator.comparingLong(BrokerMessage::globalSeq));
+            for (BrokerMessage m : toRevive) {
+                sub.revive(m, now);
+                dlq.markRedelivered(clientId, m.id(), now);
+            }
+            // 4) 结果按请求顺序返回
+            List<RedeliverItem> items = new ArrayList<>();
+            int redelivered = 0;
+            int already = 0;
+            for (Map.Entry<String, String> e : statusById.entrySet()) {
+                String status = e.getValue();
+                if ("REDELIVERED".equals(status)) {
+                    redelivered++;
+                } else {
+                    already++;
+                }
+                items.add(new RedeliverItem(e.getKey(), seqById.get(e.getKey()), status));
+            }
+            if (redelivered > 0 || already > 0) {
+                log.info("死信再投递 clientId={} 本次捞回={} 已捞过(幂等跳过)={} 在途总数={}",
+                        clientId, redelivered, already, sub.getPending().size());
+            }
+            return new RedeliverResult(clientId, redelivered, already, items);
+        }
     }
 }

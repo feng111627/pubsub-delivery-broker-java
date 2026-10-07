@@ -8,6 +8,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -19,8 +20,9 @@ import java.util.concurrent.atomic.AtomicLong;
 @Component
 public class MessageStore {
 
-    /** 消息按 globalSeq 升序存放，下标即 globalSeq-1 */
-    private final List<BrokerMessage> messages = new ArrayList<>();
+    /** 消息按 globalSeq 升序存放，下标即 globalSeq-1。
+     *  写时复制：append 在 Broker 全局锁内串行执行，find/range 允许锁外并发读。 */
+    private final List<BrokerMessage> messages = new CopyOnWriteArrayList<>();
     private final AtomicLong globalSeq = new AtomicLong(0);
     private final Map<String, Long> topicSeq = new ConcurrentHashMap<>();
 

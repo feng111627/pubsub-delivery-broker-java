@@ -23,6 +23,9 @@ public class BrokerProperties {
     /** 重投扫描间隔（毫秒） */
     private int redeliveryScanMs = 200;
 
+    /** 单次投递续期允许的最大延长毫秒数 */
+    private int maxExtendMs = 60_000;
+
     public int getAckTimeoutMs() { return ackTimeoutMs; }
     public void setAckTimeoutMs(int ackTimeoutMs) { this.ackTimeoutMs = ackTimeoutMs; }
     public int getMaxDeliveries() { return maxDeliveries; }
@@ -33,4 +36,6 @@ public class BrokerProperties {
     public void setOverflowStrategy(String overflowStrategy) { this.overflowStrategy = overflowStrategy; }
     public int getRedeliveryScanMs() { return redeliveryScanMs; }
     public void setRedeliveryScanMs(int redeliveryScanMs) { this.redeliveryScanMs = redeliveryScanMs; }
+    public int getMaxExtendMs() { return maxExtendMs; }
+    public void setMaxExtendMs(int maxExtendMs) { this.maxExtendMs = maxExtendMs; }
 }

@@ -59,6 +59,72 @@
 
 > 注意：溢出是"每个订阅端独立"发生的。同一条消息对快客户端正常投递，对已经积压的慢客户端才可能进死信。
 
+### 1.6 投递续期（消费者自己续命）
+
+消费者拿到一条消息后，如果在本次确认超时到点之前还没处理完，可以单独申请把这次投递的
+超时往后延（`POST /api/subscriptions/{clientId}/extend`，`extendMs` 为空时按
+`broker.ack-timeout-ms` 延长）。**不需要再拉取也能续期**。
+
+- 续期成功后，在新的到点之前该消息**不会被超时扫描误判重投**；续期窗口到期后仍未 ACK 的，
+  按原规则重投，`deliveryAttempt` 照常累计，到 `broker.max-deliveries` 上限照常进死信。
+- 续期**不等于确认**：不消耗/不改变投递次数，消息仍在在途集合里，消费进度不回退；
+  处理完仍需正常 ACK。
+- 续期只延不缩：同一投递窗口内多次续期，到点单调后移，不会被更短的续期提前。
+- 续期只作用于**本次投递窗口**：一旦发生重投（新一轮计时），之前的续期自动失效。
+- 单次续期长度必须为正且不超过 `broker.max-extend-ms`，否则 `400 INVALID_EXTENSION`。
+- 明确报错的情形（绝不当成成功）：
+
+| 情况 | 结果 |
+|---|---|
+| 续期当前在途消息 | `200`，返回新的超时到点 `extendedUntil` |
+| 续期已确认消息 | `400 ALREADY_ACKED` |
+| 续期已进死信的消息 | `400 DEAD_LETTERED`（提示改走死信再投递） |
+| 续期从未投递给本订阅端的消息 | `400 MESSAGE_NOT_FOUND` |
+| 续期不存在的 messageId / 未知 clientId | `400 MESSAGE_NOT_FOUND` |
+| `extendMs <= 0` 或超过 `broker.max-extend-ms` | `400 INVALID_EXTENSION` |
+
+### 1.7 死信再投递（把死信捞回来）
+
+死信不只是能看：`POST /api/dead-letters/redeliver`（`{"clientId","messageIds":[...]}`）
+把死信台账中**还没真正被消费掉**的消息重新投给对应订阅端，消费端按正常流程
+（poll → 处理 → ACK）再收到并确认。
+
+- **顺序稳定**：一批消息无论请求里什么顺序，实际按全局序号（即发布先后）升序重新入队；
+  投出时走既有"重投优先、序号升序"规则，不会在订阅端已经在走的顺序里插队。
+- **幂等**：同一批重复触发（包括并发重复触发），已捞回的消息报告
+  `ALREADY_REDELIVERED`，不重复入队、不成倍重复；台账里 `redeliveredAt>0` 表示已捞过，
+  避免反复捞导致越捞越多。
+- **新一轮投递周期**：捞回的消息 `messageId`/`seq` 不变，`deliveryAttempt` 从 1 重新计，
+  重新享有完整的 `broker.max-deliveries` 次投递机会；消费进度游标只增不减。
+- **整批原子**：批里任何一条校验失败（不存在/已确认/不在死信中），整批拒绝，
+  任何消息都不会被捞回。
+- **容量边界（确定且可解释）**：捞回后该订阅端在途总数若会超过
+  `broker.max-pending-per-subscription`，整批拒绝并返回 `429 PENDING_FULL`
+  （错误信息含当前在途数、待捞回数与上限），消息留在死信台账里**不会丢**；
+  先 ACK 腾出容量或缩小批量后重试即可。
+- 明确拒绝的情形：
+
+| 情况 | 结果 |
+|---|---|
+| 死信台账中未捞回的消息 | `200`，`status=REDELIVERED` |
+| 台账中已捞回过的消息（重复触发） | `200`，`status=ALREADY_REDELIVERED`（幂等，不重复投） |
+| 消息已被该订阅端确认 | `400 ALREADY_ACKED` |
+| 消息不存在 / 从未投递给该订阅端 | `400 MESSAGE_NOT_FOUND` |
+| 消息正在投递途中（不在死信里） | `400 NOT_DEAD_LETTERED` |
+| 空批次 / 空 messageId | `400 INVALID_REQUEST` |
+| 捞回后超出在途上限 | `429 PENDING_FULL`（整批拒绝，不丢消息） |
+
+### 1.8 与原有投递/重投/积压规则的兼容范围
+
+- 续期、再投递与正常发布/拉取/确认**共享同一把 Broker 全局锁**，全部状态变更串行化：
+  并发进行时不产生中间态，慢订阅端的续期/捞回只影响它自己的在途集合，不拖死其他订阅端。
+- 续期只推迟超时到点，不改变积压计数：在途上限、溢出策略（`dead-letter`/`drop-oldest`）
+  的语义完全不变。
+- 死信再投递受在途上限约束（见 1.7 的 `PENDING_FULL`），这是对原有积压规则的唯一新增交互：
+  宁可明确拒绝，也不悄悄丢消息。
+- 捞回后再次超时仍按 `MAX_DELIVERIES_EXCEEDED` 进死信（台账记录刷新为最新原因与时间），
+  可以再次捞回——死信台账按 (clientId, messageId) 去重，记录数不膨胀。
+
 ---
 
 ## 2. 主题匹配规则
@@ -84,7 +150,9 @@
 | POST | `/api/subscribe` | 订阅/重连 `{"clientId","filter"}` → `{clientId,filter,position}` |
 | POST | `/api/subscriptions/{clientId}/poll?max=32` | 拉取消息（短轮询，建议客户端循环调用） |
 | POST | `/api/subscriptions/{clientId}/ack` | 确认 `{"messageId"}` → `204` |
-| GET | `/api/dead-letters?clientId=` | 查询死信（不带 clientId 返回全部） |
+| POST | `/api/subscriptions/{clientId}/extend` | 投递续期 `{"messageId","extendMs"}` → `{messageId,seq,extendedUntil}` |
+| GET | `/api/dead-letters?clientId=` | 查询死信（不带 clientId 返回全部；`redeliveredAt>0` 表示已捞回） |
+| POST | `/api/dead-letters/redeliver` | 死信再投递 `{"clientId","messageIds":[...]}` → `{redelivered,alreadyRedelivered,items}` |
 
 投递对象字段：`messageId, topic, payload, seq, deliveryAttempt, redelivery`。
 
@@ -101,6 +169,7 @@
 | `broker.max-pending-per-subscription` | 100 | 单订阅端在途消息上限 |
 | `broker.overflow-strategy` | dead-letter | 积压策略：`dead-letter` / `drop-oldest` |
 | `broker.redelivery-scan-ms` | 200 | 重投扫描间隔 |
+| `broker.max-extend-ms` | 60000 | 单次投递续期允许的最大延长毫秒数 |
 
 存储为进程内内存结构：重启 Broker 会清空状态（`clientId` 的续传语义针对的是**断线重连**，不是 Broker 重启）。
 
@@ -148,6 +217,34 @@ curl -s -X POST localhost:8080/api/subscribe \
 curl -s 'localhost:8080/api/dead-letters?clientId=device-1'
 ```
 
+### 观察投递续期
+
+```bash
+# 订阅 -> 发布 -> poll 拿到 messageId 后，处理不完就续期 30s（无需再拉取）
+curl -s -X POST localhost:8080/api/subscriptions/device-1/extend \
+  -H 'Content-Type: application/json' \
+  -d '{"messageId":"<messageId>","extendMs":30000}'
+# 返回 {"messageId":...,"seq":...,"extendedUntil":<新超时到点>}
+# 在 extendedUntil 之前不会发生超时重投；到期仍未 ACK 则照常重投/进死信。
+# 对已确认或不存在的 messageId 续期会返回 400 并说明原因。
+```
+
+### 观察死信再投递
+
+```bash
+mvn spring-boot:run -Dspring-boot.run.arguments="--broker.ack-timeout-ms=1000 --broker.max-deliveries=2"
+# 订阅 -> 发布 -> poll 一次后不 ACK，等消息进死信（/api/dead-letters 可查）
+
+# 把死信捞回来（可一次一批，顺序按发布先后）
+curl -s -X POST localhost:8080/api/dead-letters/redeliver \
+  -H 'Content-Type: application/json' \
+  -d '{"clientId":"device-1","messageIds":["<messageId>"]}'
+# 返回 {"redelivered":1,"alreadyRedelivered":0,"items":[{"messageId":...,"status":"REDELIVERED"}]}
+
+# 再次 poll 即可按正常流程收到并 ACK；死信台账里该记录 redeliveredAt>0 表示已捞过。
+# 同一批重复执行上面的 redeliver：redelivered=0、alreadyRedelivered=1，不会重复投递。
+```
+
 ### 观察超时重投与死信
 
 用小超时启动，然后"poll 一次拿到消息但不 ACK、断开不再 poll"：
@@ -180,3 +277,9 @@ mvn test
 - 场景三：至少一次、超时重投、超上限进死信、重复/伪造/越权 ACK 全部明确报错
 - 场景四：dead-letter 与 drop-oldest 两种积压策略、慢订阅端不影响快订阅端
 - 场景五：完整 HTTP 端到端（真实调度器重投 → 死信）、冲突 409、畸形 JSON 400
+- 场景六：投递续期——续期窗口内不误判超时、续期只延不缩、续期到期后照常重投并累计进死信、
+  已确认/死信/从未投递/不存在消息续期与非法时长全部明确报错
+- 场景七：死信再投递——捞回后按发布先后投出并可正常 ACK、重复触发幂等不翻倍、
+  已确认/不存在/非死信消息明确拒绝、整批原子、满员 PENDING_FULL 不丢消息、
+  并发重复触发+并发发布下恰好捞回一次且整体 seq 升序、续期/再投与发布拉取并发互不拖死
+- 场景八（HTTP）：续期与死信再投递的 REST 端到端，含 400/429 错误码与台账 redeliveredAt 标记

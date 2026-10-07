@@ -33,6 +33,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class BrokerWebIntegrationTest {
 
     private static final Logger log = LoggerFactory.getLogger("场景五-HTTP端到端");
+    private static final Logger log8 = LoggerFactory.getLogger("场景八-HTTP续期再投");
 
     @Autowired
     private MockMvc mvc;
@@ -182,6 +183,154 @@ class BrokerWebIntegrationTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(r -> assertEquals("MALFORMED_REQUEST",
                         json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+    }
+
+    @Test
+    @DisplayName("投递续期 over HTTP：续期成功返回新到点；已确认/死信/不存在/非法时长均明确报错")
+    void extendOverHttp() throws Exception {
+        String cid = "web-extend";
+        log8.info("[用例] 订阅-发布-拉取后申请续期 60s，期望 200 且返回新的超时到点");
+        mvc.perform(post("/api/subscribe").contentType("application/json")
+                .content("""
+                        {"clientId":"%s","filter":"ext"}""".formatted(cid))).andExpect(status().isOk());
+        String id = publishAndGetId("ext", "work");
+        mvc.perform(post("/api/subscriptions/{cid}/poll", cid)).andExpect(status().isOk());
+
+        MvcResult ok = mvc.perform(post("/api/subscriptions/{cid}/extend", cid)
+                        .contentType("application/json")
+                        .content("""
+                                {"messageId":"%s","extendMs":60000}""".formatted(id)))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode ext = json.readTree(ok.getResponse().getContentAsString());
+        assertEquals(id, ext.get("messageId").asText());
+        assertTrue(ext.get("extendedUntil").asLong() > System.currentTimeMillis());
+        log8.info("[用例结果] 续期成功，新到点={}", ext.get("extendedUntil").asLong());
+
+        log8.info("[用例] ACK 后再续期 -> 400 ALREADY_ACKED");
+        mvc.perform(post("/api/subscriptions/{cid}/ack", cid).contentType("application/json")
+                .content("""
+                        {"messageId":"%s"}""".formatted(id))).andExpect(status().isNoContent());
+        mvc.perform(post("/api/subscriptions/{cid}/extend", cid).contentType("application/json")
+                        .content("""
+                                {"messageId":"%s","extendMs":1000}""".formatted(id)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("ALREADY_ACKED",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+
+        log8.info("[用例] 不存在消息续期 -> 400 MESSAGE_NOT_FOUND；extendMs=0 -> 400 INVALID_EXTENSION");
+        mvc.perform(post("/api/subscriptions/{cid}/extend", cid).contentType("application/json")
+                        .content("""
+                                {"messageId":"msg-nope","extendMs":1000}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("MESSAGE_NOT_FOUND",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        String id2 = publishAndGetId("ext", "work2");
+        mvc.perform(post("/api/subscriptions/{cid}/poll", cid)).andExpect(status().isOk());
+        mvc.perform(post("/api/subscriptions/{cid}/extend", cid).contentType("application/json")
+                        .content("""
+                                {"messageId":"%s","extendMs":0}""".formatted(id2)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("INVALID_EXTENSION",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+
+        log8.info("[用例] 等第二条消息超时进死信后再续期 -> 400 DEAD_LETTERED");
+        waitForDeadLetters(cid, 1);
+        mvc.perform(post("/api/subscriptions/{cid}/extend", cid).contentType("application/json")
+                        .content("""
+                                {"messageId":"%s","extendMs":1000}""".formatted(id2)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("DEAD_LETTERED",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        log8.info("[用例结果] 续期接口的各类错误均返回明确错误码");
+    }
+
+    @Test
+    @DisplayName("死信再投递 over HTTP：捞回-收到-确认闭环；重复触发幂等；已确认拒绝；满员 429")
+    void redeliverOverHttp() throws Exception {
+        String cid = "web-redeliver";
+        log8.info("[用例] 两条消息超时进死信后，批量捞回");
+        mvc.perform(post("/api/subscribe").contentType("application/json")
+                .content("""
+                        {"clientId":"%s","filter":"rd"}""".formatted(cid))).andExpect(status().isOk());
+        String id1 = publishAndGetId("rd", "a");
+        String id2 = publishAndGetId("rd", "b");
+        mvc.perform(post("/api/subscriptions/{cid}/poll", cid)).andExpect(status().isOk());
+        JsonNode dead = waitForDeadLetters(cid, 2);
+        assertEquals(0, dead.get(0).get("redeliveredAt").asLong(), "未捞回前 redeliveredAt=0");
+
+        MvcResult rr = mvc.perform(post("/api/dead-letters/redeliver")
+                        .contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["%s","%s"]}"""
+                                .formatted(cid, id2, id1)))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode result = json.readTree(rr.getResponse().getContentAsString());
+        assertEquals(2, result.get("redelivered").asInt());
+        assertEquals(0, result.get("alreadyRedelivered").asInt());
+        log8.info("[用例结果] 捞回 2 条；台账应标记 redeliveredAt>0");
+
+        JsonNode deadAfter = json.readTree(mvc.perform(get("/api/dead-letters")
+                        .param("clientId", cid)).andReturn().getResponse().getContentAsString());
+        assertTrue(deadAfter.get(0).get("redeliveredAt").asLong() > 0);
+        assertTrue(deadAfter.get(1).get("redeliveredAt").asLong() > 0);
+
+        log8.info("[用例] 捞回后 poll 应按发布先后收到两条，随后 ACK 成功");
+        JsonNode batch = json.readTree(mvc.perform(post("/api/subscriptions/{cid}/poll", cid))
+                .andReturn().getResponse().getContentAsString());
+        assertEquals(2, batch.size());
+        assertEquals(id1, batch.get(0).get("messageId").asText(), "顺序与发布先后一致");
+        assertEquals(id2, batch.get(1).get("messageId").asText());
+        for (JsonNode v : batch) {
+            mvc.perform(post("/api/subscriptions/{cid}/ack", cid).contentType("application/json")
+                    .content("""
+                            {"messageId":"%s"}""".formatted(v.get("messageId").asText())))
+                    .andExpect(status().isNoContent());
+        }
+
+        log8.info("[用例] 已确认消息再投递 -> 400 ALREADY_ACKED；不存在消息 -> 400 MESSAGE_NOT_FOUND");
+        mvc.perform(post("/api/dead-letters/redeliver").contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["%s"]}""".formatted(cid, id1)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("ALREADY_ACKED",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        mvc.perform(post("/api/dead-letters/redeliver").contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["msg-nope"]}""".formatted(cid)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("MESSAGE_NOT_FOUND",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+
+        log8.info("[用例] 在途满员（上限=2）时捞回死信 -> 429 PENDING_FULL");
+        String cid2 = "web-redeliver-full";
+        mvc.perform(post("/api/subscribe").contentType("application/json")
+                .content("""
+                        {"clientId":"%s","filter":"rf"}""".formatted(cid2))).andExpect(status().isOk());
+        publishAndGetId("rf", "1");
+        publishAndGetId("rf", "2");
+        String id3 = publishAndGetId("rf", "3"); // 溢出进死信
+        mvc.perform(post("/api/dead-letters/redeliver").contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["%s"]}""".formatted(cid2, id3)))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(r -> assertEquals("PENDING_FULL",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        log8.info("[用例结果] 满员拒绝 429 PENDING_FULL，消息留在死信台账未丢");
+    }
+
+    /** 轮询死信接口直到数量达标（后台调度器异步死信，给足等待窗口）。 */
+    private JsonNode waitForDeadLetters(String cid, int expected) throws Exception {
+        long deadline = System.currentTimeMillis() + 5_000;
+        while (System.currentTimeMillis() < deadline) {
+            JsonNode dead = json.readTree(mvc.perform(get("/api/dead-letters")
+                            .param("clientId", cid)).andReturn().getResponse().getContentAsString());
+            if (dead.size() >= expected) {
+                return dead;
+            }
+            Thread.sleep(50);
+        }
+        fail("等待 " + expected + " 条死信超时: clientId=" + cid);
+        return null;
     }
 
     private String publishAndGetId(String topic, String payload) throws Exception {
