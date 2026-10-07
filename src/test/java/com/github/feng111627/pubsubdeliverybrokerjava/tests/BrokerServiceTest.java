@@ -396,6 +396,467 @@ class BrokerServiceTest {
         }
     }
 
+    // ------------------------------------------------- 场景五：投递续期
+
+    @Nested
+    @DisplayName("场景五：投递续期（heartbeat）")
+    class Heartbeat {
+
+        @Test
+        @DisplayName("续期后在新的截止时刻前不再被误判超时重投")
+        void heartbeatPreventsTimeoutRedelivery() {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(-1); // 已投递消息本应"立即超时"
+            subscribe("c", "t");
+            PublishResult m = publish("t", "x");
+            pollOne("c");
+            log.info("[用例] 消息 {} 已投递且已超时窗口，续期 10s 后扫描不得重投", m.messageId());
+
+            HeartbeatResponse resp = broker.heartbeat("c", m.messageId(), 10_000L);
+            assertTrue(resp.deadlineAt() > System.currentTimeMillis());
+            assertEquals(0, broker.redeliverTimedOut(), "续期截止前不得被误判超时");
+
+            // 续期不等于确认：消息仍在途，且不会被当成已完成
+            DeliveryView still = pollOne("c");
+            assertEquals(m.messageId(), still.messageId());
+            assertFalse(still.redelivery());
+            assertEquals(1, still.deliveryAttempt(), "续期不递增投递次数");
+            log.info("[用例结果] 续期后扫描 0 次重投，消息仍在途 attempt=1");
+        }
+
+        @Test
+        @DisplayName("续期后仍超时且未确认：按原规则重投，次数照常累计")
+        void heartbeatExpiredThenRedelivered() throws Exception {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(-1);
+            props.setMaxDeliveries(3);
+            subscribe("c", "t");
+            PublishResult m = publish("t", "x");
+            pollOne("c");
+            broker.heartbeat("c", m.messageId(), 30L);
+            log.info("[用例] 续期 30ms 后不再续，等续期窗口过期应正常重投");
+            Thread.sleep(80);
+
+            assertEquals(1, broker.redeliverTimedOut());
+            DeliveryView retry = pollOne("c");
+            assertTrue(retry.redelivery());
+            assertEquals(2, retry.deliveryAttempt(), "重投次数照常累计");
+            assertEquals(m.messageId(), retry.messageId());
+            log.info("[用例结果] 续期过期未确认 -> attempt=2 重投，messageId 不变");
+        }
+
+        @Test
+        @DisplayName("续期只续一次投递：重投后的新窗口按原超时计算，到上限照常进死信")
+        void heartbeatDoesNotLeakIntoNextAttempt() throws Exception {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(-1);
+            props.setMaxDeliveries(1); // 首次投递超时即死信
+            subscribe("c", "t");
+            PublishResult m = publish("t", "x");
+            pollOne("c");
+            broker.heartbeat("c", m.messageId(), 30L);
+            log.info("[用例] maxDeliveries=1，续期 30ms 过期后应直接进死信而非无限挂住");
+            Thread.sleep(80);
+
+            assertEquals(1, broker.redeliverTimedOut());
+            List<DeadLetter> letters = broker.deadLetters("c");
+            assertEquals(1, letters.size());
+            assertTrue(letters.get(0).reason().contains("MAX_DELIVERIES_EXCEEDED"));
+            log.info("[用例结果] 续期不能阻止到上限进死信: reason={}", letters.get(0).reason());
+        }
+
+        @Test
+        @DisplayName("续期不是确认：续期后 ACK 才完成；ACK 后再续期报 ALREADY_ACKED")
+        void heartbeatIsNotAck() {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(-1);
+            subscribe("c", "t");
+            PublishResult m = publish("t", "x");
+            pollOne("c");
+            broker.heartbeat("c", m.messageId(), 10_000L);
+            log.info("[用例] 续期后消息仍未完成，必须显式 ACK");
+
+            ack("c", m.messageId());
+            assertEquals(0, broker.redeliverTimedOut(), "ACK 后不再参与任何超时");
+            AlreadyAckedException ex = assertThrows(AlreadyAckedException.class,
+                    () -> broker.heartbeat("c", m.messageId(), 1000L));
+            assertEquals("ALREADY_ACKED", ex.getErrorCode());
+            log.info("[用例结果] 续期未确认消息；ACK 完成后再续期明确报 ALREADY_ACKED");
+        }
+
+        @Test
+        @DisplayName("续期边界：不存在/从未投递/未拉取/已死信/超长续期全部明确报错")
+        void heartbeatErrors() {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(-1);
+            props.setMaxDeliveries(1);
+            subscribe("c", "t");
+            subscribe("other", "u");
+            PublishResult m = publish("t", "x");
+            log.info("[用例] 覆盖 5 类非法续期");
+
+            MessageNotFoundException ghost = assertThrows(MessageNotFoundException.class,
+                    () -> broker.heartbeat("c", "msg-nope", 1000L));
+            assertEquals("MESSAGE_NOT_FOUND", ghost.getErrorCode());
+
+            // 从未投递给该订阅端（主题不匹配）
+            MessageNotFoundException notMine = assertThrows(MessageNotFoundException.class,
+                    () -> broker.heartbeat("other", m.messageId(), 1000L));
+            assertTrue(notMine.getMessage().contains("从未投递"));
+
+            // 在途但尚未被 poll 取走：不存在需要续期的投递
+            ApiException notYet = assertThrows(ApiException.class,
+                    () -> broker.heartbeat("c", m.messageId(), 1000L));
+            assertEquals("NOT_YET_DELIVERED", notYet.getErrorCode());
+
+            // 超长续期
+            pollOne("c");
+            ApiException tooLong = assertThrows(ApiException.class,
+                    () -> broker.heartbeat("c", m.messageId(), 999_999_999L));
+            assertEquals("INVALID_HEARTBEAT", tooLong.getErrorCode());
+            assertTrue(tooLong.getMessage().contains("heartbeat-max-extension-ms"));
+
+            // 已死信
+            broker.redeliverTimedOut();
+            ApiException dead = assertThrows(ApiException.class,
+                    () -> broker.heartbeat("c", m.messageId(), 1000L));
+            assertEquals("DEAD_LETTERED", dead.getErrorCode());
+            assertTrue(dead.getMessage().contains("redrive"), "错误信息应指引去再投递");
+            log.info("[用例结果] MESSAGE_NOT_FOUND/从未投递/NOT_YET_DELIVERED/INVALID_HEARTBEAT/DEAD_LETTERED 均明确报错");
+        }
+
+        @Test
+        @DisplayName("并发续期与超时扫描、发布并行：不错乱、不丢、其他订阅端不受影响")
+        void concurrentHeartbeat() throws Exception {
+            Logger log = LoggerFactory.getLogger("场景五-续期");
+            props.setAckTimeoutMs(60);
+            props.setHeartbeatMaxExtensionMs(10_000);
+            subscribe("hb", "t");
+            subscribe("bystander", "t");
+            PublishResult m = publish("t", "x");
+            pollOne("hb");
+            log.info("[用例] 8 线程并发续期同一消息 + 1 线程持续超时扫描 + 1 线程持续发布");
+
+            int threads = 8;
+            ExecutorService pool = Executors.newFixedThreadPool(threads + 2);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threads);
+            List<Throwable> failures = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        for (int k = 0; k < 50; k++) {
+                            broker.heartbeat("hb", m.messageId(), 500L);
+                        }
+                    } catch (Throwable t) {
+                        synchronized (failures) { failures.add(t); }
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            // 扫描线程：续期窗口 500ms 远大于扫描周期，期间不得把该消息重投
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    while (done.getCount() > 0) {
+                        broker.redeliverTimedOut();
+                        Thread.sleep(5);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            // 发布线程：验证续期/扫描不阻塞正常发布与其他订阅端
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    for (int k = 0; k < 50; k++) {
+                        publish("t", "bg-" + k);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            start.countDown();
+            assertTrue(done.await(15, TimeUnit.SECONDS));
+            pool.shutdown();
+            assertTrue(failures.isEmpty(), "并发续期不应失败: " + failures);
+
+            DeliveryView d = pollOne("hb");
+            assertEquals(m.messageId(), d.messageId());
+            assertEquals(1, d.deliveryAttempt(), "持续续期期间不得被超时重投");
+            ack("hb", m.messageId());
+            // 旁观订阅端应能收到全部 51 条（首条 + 后台 50 条），不受 hb 续期影响
+            List<DeliveryView> other = pollAll("bystander");
+            assertEquals(51, other.size(), "其他订阅端投递不应被续期拖住");
+            log.info("[用例结果] 并发续期 400 次零失败，消息未被误判重投，旁观订阅端收齐 51 条");
+        }
+    }
+
+    // ------------------------------------------------- 场景六：死信再投递
+
+    @Nested
+    @DisplayName("场景六：死信再投递（redrive）")
+    class Redrive {
+
+        /** 让一条消息立即进死信：maxDeliveries=1 + 立即超时。 */
+        private BrokerService deadLetterBroker() {
+            BrokerProperties p = new BrokerProperties();
+            p.setAckTimeoutMs(-1);
+            p.setMaxDeliveries(1);
+            return brokerWith(p);
+        }
+
+        @Test
+        @DisplayName("死信再投递后按正常流程收到并确认；台账可见已再投状态")
+        void redriveBasicFlow() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            PublishResult m = b.publish(new PublishRequest("t", "x"));
+            b.poll("c", 10);
+            b.redeliverTimedOut();
+            assertEquals(1, b.deadLetters("c").size());
+            log.info("[用例] 消息 {} 已进死信，发起再投递", m.messageId());
+
+            RedriveResponse resp = b.redrive("c", List.of(m.messageId()));
+            assertEquals(1, resp.count());
+            assertEquals(List.of(m.messageId()), resp.messageIds());
+
+            List<DeliveryView> got = b.poll("c", 10);
+            assertEquals(1, got.size());
+            assertEquals(m.messageId(), got.get(0).messageId());
+            assertEquals(1, got.get(0).deliveryAttempt(), "再投递按全新一次投递计时");
+            assertFalse(got.get(0).redelivery());
+
+            // 台账能看出已再投
+            List<DeadLetterView> views = b.deadLetterViews("c");
+            assertTrue(views.get(0).redriven());
+            assertNotNull(views.get(0).redrivenAt());
+
+            // 正常 ACK 完成，之后不再出现
+            b.acknowledge("c", m.messageId());
+            assertTrue(b.poll("c", 10).isEmpty());
+            log.info("[用例结果] 再投递->收到->ACK 完成；台账 redriven=true");
+        }
+
+        @Test
+        @DisplayName("同一批重复再投递：第二次明确拒绝，不会成倍重复")
+        void duplicateRedriveRejected() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            PublishResult m = b.publish(new PublishRequest("t", "x"));
+            b.poll("c", 10);
+            b.redeliverTimedOut();
+            b.redrive("c", List.of(m.messageId()));
+            log.info("[用例] 同一消息再次 redrive 必须明确拒绝且不出第二份拷贝");
+
+            ApiException dup = assertThrows(ApiException.class,
+                    () -> b.redrive("c", List.of(m.messageId())));
+            assertEquals("NOT_DEAD_LETTERED", dup.getErrorCode());
+            assertTrue(dup.getMessage().contains(m.messageId()));
+
+            List<DeliveryView> got = b.poll("c", 10);
+            assertEquals(1, got.size(), "重复再投递不得产生第二份拷贝");
+            log.info("[用例结果] 第二次 redrive 报 NOT_DEAD_LETTERED，poll 仅 1 份");
+        }
+
+        @Test
+        @DisplayName("批量再投递保持原发布顺序；乱序入参、重复触发都不乱序不重复")
+        void redriveBatchOrdering() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            PublishResult m1 = b.publish(new PublishRequest("t", "1"));
+            PublishResult m2 = b.publish(new PublishRequest("t", "2"));
+            PublishResult m3 = b.publish(new PublishRequest("t", "3"));
+            b.poll("c", 10);
+            b.redeliverTimedOut();
+            assertEquals(3, b.deadLetters("c").size());
+            log.info("[用例] 3 条死信，按乱序 [m3,m1,m2] 提交再投递");
+
+            RedriveResponse resp = b.redrive("c",
+                    List.of(m3.messageId(), m1.messageId(), m2.messageId()));
+            assertEquals(List.of(m1.messageId(), m2.messageId(), m3.messageId()),
+                    resp.messageIds(), "响应必须按原发布顺序（全局序号升序）");
+            assertEquals(List.of(m1.globalSeq(), m2.globalSeq(), m3.globalSeq()), resp.seqs());
+
+            List<DeliveryView> got = b.poll("c", 10);
+            assertEquals(List.of("1", "2", "3"), payloads(got),
+                    "批内相对先后必须与原发布先后一致");
+            log.info("[用例结果] 乱序入参仍按发布顺序 {} 投递", resp.seqs());
+        }
+
+        @Test
+        @DisplayName("再投递落回正确相对位置：插到在途窗口中自己原来的序号位置，不插队")
+        void redriveLandsAtOriginalPosition() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            PublishResult m1 = b.publish(new PublishRequest("t", "1"));
+            PublishResult m2 = b.publish(new PublishRequest("t", "2"));
+            b.poll("c", 10);
+            b.redeliverTimedOut(); // m1,m2 进死信
+            PublishResult m3 = b.publish(new PublishRequest("t", "3")); // 仍在途、未拉取
+            log.info("[用例] m1,m2 死信后又有新消息 m3 在途，再投递 m1,m2 应落在 m3 之前（原序号位置）");
+
+            b.redrive("c", List.of(m2.messageId(), m1.messageId()));
+            List<DeliveryView> got = b.poll("c", 10);
+            assertEquals(List.of("1", "2", "3"), payloads(got),
+                    "再投递消息按原序号回到窗口，不打乱在途顺序");
+            assertEquals(m3.messageId(), got.get(2).messageId());
+            log.info("[用例结果] poll 顺序 1,2,3：再投递消息未插队");
+        }
+
+        @Test
+        @DisplayName("再投递边界：已确认/不存在/从未投递明确报错；整批原子拒绝")
+        void redriveErrors() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            subscribe(b, "other", "u");
+            PublishResult acked = b.publish(new PublishRequest("t", "acked"));
+            PublishResult dead = b.publish(new PublishRequest("t", "dead"));
+            b.poll("c", 10);
+            b.acknowledge("c", acked.messageId());
+            b.redeliverTimedOut(); // 仅 dead 进死信（acked 已完成）
+            log.info("[用例] 覆盖已确认/不存在/从未投递/整批原子性");
+
+            AlreadyAckedException ackedEx = assertThrows(AlreadyAckedException.class,
+                    () -> b.redrive("c", List.of(acked.messageId())));
+            assertEquals("ALREADY_ACKED", ackedEx.getErrorCode());
+
+            MessageNotFoundException ghost = assertThrows(MessageNotFoundException.class,
+                    () -> b.redrive("c", List.of("msg-nope")));
+            assertEquals("MESSAGE_NOT_FOUND", ghost.getErrorCode());
+
+            MessageNotFoundException notMine = assertThrows(MessageNotFoundException.class,
+                    () -> b.redrive("other", List.of(dead.messageId())));
+            assertTrue(notMine.getMessage().contains("从未投递"));
+
+            // 整批原子：好 id + 坏 id 一起提交 -> 整批拒绝，好 id 仍在死信中
+            assertThrows(MessageNotFoundException.class,
+                    () -> b.redrive("c", List.of(dead.messageId(), "msg-nope")));
+            assertFalse(b.deadLetterViews("c").get(0).redriven(),
+                    "整批拒绝后任何一条都不得被再投");
+            log.info("[用例结果] 三类错误明确报错；含坏 id 的批次整体不生效");
+        }
+
+        @Test
+        @DisplayName("容量边界：在途窗口放不下整批时明确拒绝，不截断不丢消息；超限批量拒绝")
+        void redriveCapacity() {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerProperties p = new BrokerProperties();
+            p.setAckTimeoutMs(-1);
+            p.setMaxDeliveries(1);
+            p.setMaxPendingPerSubscription(2);
+            p.setMaxRedriveBatch(2);
+            BrokerService b = brokerWith(p);
+            b.subscribe("c", "t");
+            PublishResult d1 = b.publish(new PublishRequest("t", "d1"));
+            PublishResult d2 = b.publish(new PublishRequest("t", "d2"));
+            b.poll("c", 10);
+            b.redeliverTimedOut(); // d1,d2 死信，窗口腾空
+            b.publish(new PublishRequest("t", "n1"));
+            b.publish(new PublishRequest("t", "n2")); // 窗口重新占满 2/2
+            log.info("[用例] 窗口满(2/2)时再投递 2 条死信，必须明确拒绝");
+
+            ApiException full = assertThrows(ApiException.class,
+                    () -> b.redrive("c", List.of(d1.messageId(), d2.messageId())));
+            assertEquals("REDRIVE_CAPACITY_EXCEEDED", full.getErrorCode());
+            assertTrue(full.getMessage().contains("剩余容量 0"));
+            assertFalse(b.deadLetterViews("c").get(0).redriven(), "容量拒绝后不得部分生效");
+
+            // 超限批量
+            ApiException tooBig = assertThrows(ApiException.class,
+                    () -> b.redrive("c", List.of(d1.messageId(), d2.messageId(), "x")));
+            assertEquals("REDRIVE_BATCH_TOO_LARGE", tooBig.getErrorCode());
+
+            // 确认一条腾出容量后，单条再投递成功
+            List<DeliveryView> inflight = b.poll("c", 10);
+            b.acknowledge("c", inflight.get(0).messageId());
+            RedriveResponse ok = b.redrive("c", List.of(d1.messageId()));
+            assertEquals(1, ok.count());
+            log.info("[用例结果] 容量满拒绝且不部分生效；腾出容量后单条再投递成功");
+        }
+
+        @Test
+        @DisplayName("并发再投递同一批：只有一个成功，消息不成倍、顺序不乱；与发布并发不互相拖死")
+        void concurrentRedrive() throws Exception {
+            Logger log = LoggerFactory.getLogger("场景六-再投递");
+            BrokerService b = deadLetterBroker();
+            b.subscribe("c", "t");
+            List<String> ids = new ArrayList<>();
+            for (int i = 1; i <= 10; i++) {
+                ids.add(b.publish(new PublishRequest("t", "m" + i)).messageId());
+            }
+            b.poll("c", 100);
+            b.redeliverTimedOut();
+            assertEquals(10, b.deadLetters("c").size());
+            log.info("[用例] 4 线程并发 redrive 同一批 10 条 + 2 线程并发发布");
+
+            int threads = 4;
+            ExecutorService pool = Executors.newFixedThreadPool(threads + 2);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threads + 2);
+            List<RedriveResponse> successes = new ArrayList<>();
+            List<Throwable> rejections = new ArrayList<>();
+            for (int i = 0; i < threads; i++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        RedriveResponse r = b.redrive("c", ids);
+                        synchronized (successes) { successes.add(r); }
+                    } catch (Throwable t) {
+                        synchronized (rejections) { rejections.add(t); }
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            for (int i = 0; i < 2; i++) {
+                int n = i;
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        for (int k = 0; k < 20; k++) {
+                            b.publish(new PublishRequest("t", "bg" + n + "-" + k));
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            start.countDown();
+            assertTrue(done.await(15, TimeUnit.SECONDS));
+            pool.shutdown();
+
+            assertEquals(1, successes.size(), "同一批并发再投递只能成功一次");
+            assertEquals(threads - 1, rejections.size());
+            for (Throwable t : rejections) {
+                assertEquals("NOT_DEAD_LETTERED", ((ApiException) t).getErrorCode());
+            }
+            // 再投递的 10 条 + 后台 40 条：poll 严格按序号升序、无重复
+            List<DeliveryView> got = b.poll("c", 1000);
+            assertEquals(50, got.size(), "再投递 10 条 + 并发发布 40 条，不得重复不得丢");
+            List<Long> seqs = got.stream().map(DeliveryView::seq).collect(Collectors.toList());
+            List<Long> sorted = new ArrayList<>(seqs);
+            java.util.Collections.sort(sorted);
+            assertEquals(sorted, seqs, "并发下投递顺序必须稳定");
+            assertEquals(seqs.size(), Set.copyOf(seqs).size(), "不得成倍重复");
+            log.info("[用例结果] 并发 redrive 仅 1 次成功，共 {} 条按序投递、零重复", got.size());
+        }
+
+        private void subscribe(BrokerService b, String clientId, String filter) {
+            b.subscribe(clientId, filter);
+        }
+    }
+
     private List<String> payloads(List<DeliveryView> views) {
         return views.stream().map(DeliveryView::payload).collect(Collectors.toList());
     }

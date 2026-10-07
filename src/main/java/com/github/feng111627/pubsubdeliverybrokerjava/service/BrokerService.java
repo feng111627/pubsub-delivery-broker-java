@@ -19,6 +19,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
@@ -244,6 +245,70 @@ public class BrokerService {
         }
     }
 
+    // ------------------------------------------------------- 投递续期
+
+    /**
+     * 投递续期：消费者在本次确认超时到点前申请把超时截止时刻往后延。
+     *
+     * <p>语义约束：</p>
+     * <ul>
+     *   <li>只延长计时，不把消息当已确认，不移除在途，不回退任何进度；</li>
+     *   <li>续期只作用于"本次投递"：一旦超时进入重投，新投递窗口重新计算；</li>
+     *   <li>续期后仍超时且未确认，按原规则重投，投递次数照常累计，到上限照常进死信。</li>
+     * </ul>
+     *
+     * @param extendMs 续期时长；null 或 <=0 表示续一个完整 ACK 窗口
+     */
+    public HeartbeatResponse heartbeat(String clientId, String messageId, Long extendMs) {
+        if (messageId == null || messageId.isBlank()) {
+            throw new InvalidSubscriptionException("heartbeat.messageId 不能为空");
+        }
+        Subscription sub = subscriptions.get(clientId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "订阅端不存在: clientId=" + clientId + "，请先调用 /api/subscribe"));
+        BrokerMessage msg = messages.find(messageId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "消息不存在: messageId=" + messageId));
+        long extension = extendMs == null || extendMs <= 0 ? props.getAckTimeoutMs() : extendMs;
+        if (extension > props.getHeartbeatMaxExtensionMs()) {
+            throw new ApiException("INVALID_HEARTBEAT",
+                    "续期时长 " + extension + "ms 超过上限 broker.heartbeat-max-extension-ms="
+                            + props.getHeartbeatMaxExtensionMs()
+                            + "ms；请分多次续期，防止消息被无限挂住");
+        }
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            long seq = msg.globalSeq();
+            PendingDelivery pd = sub.getPending(seq);
+            if (pd != null) {
+                if (!pd.isDelivered()) {
+                    throw new ApiException("NOT_YET_DELIVERED",
+                            "消息尚未被本订阅端拉取过，不存在需要续期的投递: clientId=" + clientId
+                                    + ", messageId=" + messageId + "；请先 poll 取到消息后再续期");
+                }
+                long deadlineAt = now + extension;
+                pd.extendDeadline(deadlineAt);
+                log.info("续期成功 clientId={} messageId={} seq={} 延长 {}ms，新截止时刻={}",
+                        clientId, messageId, seq, extension, deadlineAt);
+                return new HeartbeatResponse(messageId, clientId, extension, deadlineAt);
+            }
+            if (sub.isAcked(seq)) {
+                throw new AlreadyAckedException(
+                        "消息已经确认过，无需续期: clientId=" + clientId
+                                + ", messageId=" + messageId + ", seq=" + seq);
+            }
+            if (sub.isDead(seq)) {
+                throw new ApiException("DEAD_LETTERED",
+                        "消息已进入死信，本次投递已终结，无法续期: clientId=" + clientId
+                                + ", messageId=" + messageId
+                                + "；如需重新消费请使用 POST /api/dead-letters/redrive 再投递");
+            }
+            throw new MessageNotFoundException(
+                    "该消息从未投递给此订阅端（可能主题不匹配或订阅晚于发布），无法续期: clientId="
+                            + clientId + ", messageId=" + messageId + ", topic=" + msg.topic());
+        }
+    }
+
     // ------------------------------------------------------- 超时重投 / 死信
 
     /**
@@ -262,8 +327,9 @@ public class BrokerService {
         synchronized (lock) {
             for (Subscription sub : subscriptions.all()) {
                 for (PendingDelivery pd : new ArrayList<>(sub.getPending().values())) {
-                    // 客户端尚未拉取过的消息不参与超时，避免"未投递先重投"
-                    if (!pd.isDelivered() || now - pd.getLastSentAt() < timeout) {
+                    // 客户端尚未拉取过的消息不参与超时，避免"未投递先重投"；
+                    // 续期过的消息按续期后的截止时刻判断，截止前不得误判超时
+                    if (!pd.isDelivered() || now < pd.effectiveDeadline(timeout)) {
                         continue;
                     }
                     BrokerMessage msg = pd.getMessage();
@@ -292,5 +358,95 @@ public class BrokerService {
         return clientId == null || clientId.isBlank()
                 ? dlq.listAll()
                 : dlq.listByClient(clientId);
+    }
+
+    /** 死信台账视图：附带"是否已被再投递"状态，便于运维判断哪些还没捞回。 */
+    public List<DeadLetterView> deadLetterViews(String clientId) {
+        List<DeadLetterView> out = new ArrayList<>();
+        for (DeadLetter l : deadLetters(clientId)) {
+            out.add(new DeadLetterView(l.clientId(), l.messageId(), l.topic(), l.reason(),
+                    l.deadAt(), dlq.isRedriven(l.clientId(), l.messageId()),
+                    dlq.redrivenAt(l.clientId(), l.messageId())));
+        }
+        return out;
+    }
+
+    // ------------------------------------------------------- 死信再投递
+
+    /**
+     * 死信再投递（redrive）：把一批死信消息重新投回其归属订阅端的在途窗口。
+     *
+     * <p>语义约束：</p>
+     * <ul>
+     *   <li>整批原子：任一条不合法（不存在/已确认/不在死信中）则整批拒绝，不产生部分生效；</li>
+     *   <li>批内按全局序号（原发布顺序）重新入窗，重复触发同一批不会乱序也不会成倍重复
+     *       ——第二次触发时消息已不在死信中，会被明确拒绝；</li>
+     *   <li>容量确定：在途窗口放不下整批时明确拒绝（REDRIVE_CAPACITY_EXCEEDED），不悄悄丢消息；</li>
+     *   <li>再投递的消息按全新一次投递计时（attempt=1），走正常 poll/ACK/超时重投流程。</li>
+     * </ul>
+     */
+    public RedriveResponse redrive(String clientId, List<String> messageIds) {
+        if (clientId == null || clientId.isBlank()) {
+            throw new InvalidSubscriptionException("redrive.clientId 不能为空");
+        }
+        if (messageIds == null || messageIds.isEmpty()) {
+            throw new InvalidSubscriptionException("redrive.messageIds 不能为空");
+        }
+        if (messageIds.size() > props.getMaxRedriveBatch()) {
+            throw new ApiException("REDRIVE_BATCH_TOO_LARGE",
+                    "单次再投递 " + messageIds.size() + " 条，超过上限 broker.max-redrive-batch="
+                            + props.getMaxRedriveBatch() + "；请分批再投递");
+        }
+        Subscription sub = subscriptions.get(clientId)
+                .orElseThrow(() -> new MessageNotFoundException(
+                        "订阅端不存在: clientId=" + clientId + "，请先调用 /api/subscribe"));
+        long now = System.currentTimeMillis();
+        synchronized (lock) {
+            // 1) 整批校验：任何一条不合法都直接拒绝，状态不变
+            List<BrokerMessage> batch = new ArrayList<>(messageIds.size());
+            for (String id : messageIds) {
+                BrokerMessage msg = messages.find(id)
+                        .orElseThrow(() -> new MessageNotFoundException(
+                                "消息不存在，无法再投递: messageId=" + id));
+                long seq = msg.globalSeq();
+                if (sub.isAcked(seq)) {
+                    throw new AlreadyAckedException(
+                            "消息已经确认过，无需再投递: clientId=" + clientId
+                                    + ", messageId=" + id + ", seq=" + seq);
+                }
+                if (sub.isPending(seq)) {
+                    throw new ApiException("NOT_DEAD_LETTERED",
+                            "消息不在死信中（正在投递中或已被再投递），拒绝重复再投递: clientId=" + clientId
+                                    + ", messageId=" + id + ", seq=" + seq);
+                }
+                if (!sub.isDead(seq)) {
+                    throw new MessageNotFoundException(
+                            "该消息从未投递给此订阅端，不在其死信中: clientId=" + clientId
+                                    + ", messageId=" + id + ", topic=" + msg.topic());
+                }
+                batch.add(msg);
+            }
+            // 2) 容量检查：在途窗口必须放得下整批，否则明确拒绝（不截断、不丢消息）
+            int free = props.getMaxPendingPerSubscription() - sub.getPending().size();
+            if (batch.size() > free) {
+                throw new ApiException("REDRIVE_CAPACITY_EXCEEDED",
+                        "订阅端 " + clientId + " 在途窗口剩余容量 " + free + "，放不下本批 "
+                                + batch.size() + " 条再投递（上限 broker.max-pending-per-subscription="
+                                + props.getMaxPendingPerSubscription()
+                                + "）；请先消费/确认部分在途消息后再试");
+            }
+            // 3) 按全局序号升序（原发布顺序）重新入窗；TreeMap 保证批内相对顺序稳定
+            batch.sort(Comparator.comparingLong(BrokerMessage::globalSeq));
+            List<String> ids = new ArrayList<>(batch.size());
+            List<Long> seqs = new ArrayList<>(batch.size());
+            for (BrokerMessage msg : batch) {
+                sub.markRedriven(msg, now);
+                dlq.markRedriven(clientId, msg.id(), now);
+                ids.add(msg.id());
+                seqs.add(msg.globalSeq());
+            }
+            log.info("死信再投递 clientId={} 数量={} seqs={}", clientId, ids.size(), seqs);
+            return new RedriveResponse(clientId, ids.size(), ids, seqs);
+        }
     }
 }

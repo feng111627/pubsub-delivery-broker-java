@@ -23,6 +23,12 @@ public class BrokerProperties {
     /** 重投扫描间隔（毫秒） */
     private int redeliveryScanMs = 200;
 
+    /** 单次投递续期的最大时长（毫秒），防止客户端把一条消息无限挂住 */
+    private int heartbeatMaxExtensionMs = 60_000;
+
+    /** 单次死信再投递的最大批量（条），超过则明确拒绝 */
+    private int maxRedriveBatch = 100;
+
     public int getAckTimeoutMs() { return ackTimeoutMs; }
     public void setAckTimeoutMs(int ackTimeoutMs) { this.ackTimeoutMs = ackTimeoutMs; }
     public int getMaxDeliveries() { return maxDeliveries; }
@@ -33,4 +39,8 @@ public class BrokerProperties {
     public void setOverflowStrategy(String overflowStrategy) { this.overflowStrategy = overflowStrategy; }
     public int getRedeliveryScanMs() { return redeliveryScanMs; }
     public void setRedeliveryScanMs(int redeliveryScanMs) { this.redeliveryScanMs = redeliveryScanMs; }
+    public int getHeartbeatMaxExtensionMs() { return heartbeatMaxExtensionMs; }
+    public void setHeartbeatMaxExtensionMs(int heartbeatMaxExtensionMs) { this.heartbeatMaxExtensionMs = heartbeatMaxExtensionMs; }
+    public int getMaxRedriveBatch() { return maxRedriveBatch; }
+    public void setMaxRedriveBatch(int maxRedriveBatch) { this.maxRedriveBatch = maxRedriveBatch; }
 }

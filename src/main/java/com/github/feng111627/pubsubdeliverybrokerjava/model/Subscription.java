@@ -79,6 +79,16 @@ public class Subscription {
         deadSeqs.add(seq);
     }
 
+    /**
+     * 死信再投递：把消息从死信集合移回在途，按全新一次投递重新计时（attempt=1）。
+     * 全局序号不变，因此它会回到在途窗口中自己原来的相对位置，不打乱其他消息的顺序；
+     * 已投递游标只增不减，不受影响。
+     */
+    public void markRedriven(BrokerMessage msg, long now) {
+        deadSeqs.remove(msg.globalSeq());
+        registerPending(msg, now);
+    }
+
     public boolean isAcked(long seq) { return ackedSeqs.contains(seq); }
     public boolean isDead(long seq) { return deadSeqs.contains(seq); }
     public boolean isPending(long seq) { return pending.containsKey(seq); }

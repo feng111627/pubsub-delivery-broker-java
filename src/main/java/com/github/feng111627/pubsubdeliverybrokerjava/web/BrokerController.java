@@ -1,6 +1,5 @@
 package com.github.feng111627.pubsubdeliverybrokerjava.web;
 
-import com.github.feng111627.pubsubdeliverybrokerjava.dlq.DeadLetter;
 import com.github.feng111627.pubsubdeliverybrokerjava.service.BrokerService;
 import com.github.feng111627.pubsubdeliverybrokerjava.web.dto.*;
 import org.springframework.http.ResponseEntity;
@@ -42,8 +41,20 @@ public class BrokerController {
         return ResponseEntity.noContent().build();
     }
 
+    @PostMapping("/subscriptions/{clientId}/heartbeat")
+    public ResponseEntity<HeartbeatResponse> heartbeat(@PathVariable String clientId,
+                                                       @RequestBody HeartbeatRequest request) {
+        return ResponseEntity.ok(
+                brokerService.heartbeat(clientId, request.messageId(), request.extendMs()));
+    }
+
     @GetMapping("/dead-letters")
-    public ResponseEntity<List<DeadLetter>> deadLetters(@RequestParam(required = false) String clientId) {
-        return ResponseEntity.ok(brokerService.deadLetters(clientId));
+    public ResponseEntity<List<DeadLetterView>> deadLetters(@RequestParam(required = false) String clientId) {
+        return ResponseEntity.ok(brokerService.deadLetterViews(clientId));
+    }
+
+    @PostMapping("/dead-letters/redrive")
+    public ResponseEntity<RedriveResponse> redrive(@RequestBody RedriveRequest request) {
+        return ResponseEntity.ok(brokerService.redrive(request.clientId(), request.messageIds()));
     }
 }

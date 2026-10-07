@@ -46,7 +46,59 @@
   全局序号（等同主题内发布顺序）升序，无重复、无跳号（未触发溢出策略时）。
 - 轮询返回顺序：待重投消息优先，其次首次投递；两类内部均按 `seq` 升序。
 
-### 1.5 积压策略（行为确定、可解释）
+### 1.5 投递续期（heartbeat）：处理时间不可控时自己续命
+
+消费者拿到一条消息后，如果在 ACK 超时到点前还没处理完，可以针对**这一条消息的本次投递**申请续期：
+
+- `POST /api/subscriptions/{clientId}/heartbeat`，请求体 `{"messageId":"...","extendMs":5000}`。
+  `extendMs` 省略或 <=0 时按 `broker.ack-timeout-ms` 续一个完整窗口；单次续期上限为
+  `broker.heartbeat-max-extension-ms`（默认 60s），超过明确报 `400 INVALID_HEARTBEAT`，
+  防止一条消息被无限挂住。响应返回新的绝对截止时刻 `deadlineAt`（epoch 毫秒）。
+- 续期**只延长计时**：不把消息当已确认、不移除在途、不回退任何消费进度。
+- 续期成功后在新的截止时刻前，超时扫描**不会**把这条消息误判为超时重投；不需要再拉取也能续。
+- 续期只作用于"本次投递"：若续期后仍超时且未确认，按原规则重投（`deliveryAttempt` 照常累计，
+  到 `broker.max-deliveries` 上限照常进死信）；重投后的新投递窗口重新计算，之前的续期不带过去。
+- 非法续期全部明确报错（绝不当成成功）：
+
+| 情况 | 结果 |
+|---|---|
+| 续期当前在途且已投递的消息 | `200`，返回新截止时刻 |
+| 续期已确认的消息 | `400 ALREADY_ACKED` |
+| 续期不存在的 messageId | `400 MESSAGE_NOT_FOUND` |
+| 续期从未投递给本订阅端的消息 | `400 MESSAGE_NOT_FOUND`（说明主题不匹配/订阅更晚） |
+| 续期在途但还没被 poll 取走的消息 | `400 NOT_YET_DELIVERED`（不存在需要续期的投递） |
+| 续期已进死信的消息 | `400 DEAD_LETTERED`（并指引去 redrive） |
+| 续期时长超过上限 | `400 INVALID_HEARTBEAT` |
+
+### 1.6 死信再投递（redrive）：把死信捞回来重新消费
+
+死信不只是能看，还能捞回来重新投给原订阅端：
+
+- `POST /api/dead-letters/redrive`，请求体 `{"clientId":"...","messageIds":["id1","id2",...]}`。
+- **整批原子**：任一条不合法（不存在 / 已确认 / 不在死信中）则整批拒绝，不产生部分生效。
+- **顺序稳定**：批内按全局序号（即原发布顺序）重新进入在途窗口；入参乱序不影响结果。
+  再投递的消息落回窗口中自己原来的序号位置，不插队、不打乱该订阅端在途消息的顺序。
+- **重复触发安全**：同一批再次 redrive 时，消息已不在死信中，明确报 `400 NOT_DEAD_LETTERED`，
+  不会成倍重复；`GET /api/dead-letters` 返回的每条记录带 `redriven`/`redrivenAt`，
+  能直接看出哪些已经捞回过。
+- **容量确定**：在途窗口放不下整批时明确报 `400 REDRIVE_CAPACITY_EXCEEDED`（不截断、不悄悄丢消息）；
+  单批条数超过 `broker.max-redrive-batch`（默认 100）报 `400 REDRIVE_BATCH_TOO_LARGE`，分批即可。
+- 再投递的消息按**全新一次投递**计时（`deliveryAttempt=1`），走正常的 poll/ACK/超时重投流程，
+  确认后彻底完成；`deliveredSeq` 游标只增不减，订阅位置不回退。
+- 对已经确认过的消息再投递报 `400 ALREADY_ACKED`，对不存在的消息报 `400 MESSAGE_NOT_FOUND`。
+
+### 1.7 与原有投递/重投/积压规则的兼容范围
+
+- 续期与再投递都复用同一把进程内串行锁，与发布、拉取、ACK、超时扫描天然并发安全；
+  某个订阅端的续期/再投递只操作自己的在途集合，不会拖死其他订阅端。
+- 续期不改变任何既有规则：超时窗口的起算方式、重投次数上限、死信条件、积压策略全部照旧，
+  它只是把"本次投递"的截止时刻往后推。
+- 再投递回来的消息占用 `broker.max-pending-per-subscription` 窗口容量，容量不够时明确拒绝，
+  不会触发溢出策略去顶掉别人的在途消息；进入窗口后与正常消息走完全相同的
+  poll/ACK/超时重投/死信路径。
+- 死信台账只增不改：再投递不会删除台账记录，只把 `redriven` 标记置真，审计轨迹完整。
+
+### 1.8 积压策略（行为确定、可解释）
 
 单订阅端在途（未完成）消息数达到 `broker.max-pending-per-subscription` 后，新匹配消息由
 `broker.overflow-strategy` 决定确定性行为，且被移出投递路径的消息**一律进入死信台账**：
@@ -84,7 +136,9 @@
 | POST | `/api/subscribe` | 订阅/重连 `{"clientId","filter"}` → `{clientId,filter,position}` |
 | POST | `/api/subscriptions/{clientId}/poll?max=32` | 拉取消息（短轮询，建议客户端循环调用） |
 | POST | `/api/subscriptions/{clientId}/ack` | 确认 `{"messageId"}` → `204` |
-| GET | `/api/dead-letters?clientId=` | 查询死信（不带 clientId 返回全部） |
+| POST | `/api/subscriptions/{clientId}/heartbeat` | 投递续期 `{"messageId","extendMs"?}` → `{messageId,clientId,extendMs,deadlineAt}` |
+| GET | `/api/dead-letters?clientId=` | 查询死信（不带 clientId 返回全部），每条含 `redriven`/`redrivenAt` |
+| POST | `/api/dead-letters/redrive` | 死信再投递 `{"clientId","messageIds":[...]}` → `{clientId,count,messageIds,seqs}` |
 
 投递对象字段：`messageId, topic, payload, seq, deliveryAttempt, redelivery`。
 
@@ -101,6 +155,8 @@
 | `broker.max-pending-per-subscription` | 100 | 单订阅端在途消息上限 |
 | `broker.overflow-strategy` | dead-letter | 积压策略：`dead-letter` / `drop-oldest` |
 | `broker.redelivery-scan-ms` | 200 | 重投扫描间隔 |
+| `broker.heartbeat-max-extension-ms` | 60000 | 单次投递续期的最大时长 |
+| `broker.max-redrive-batch` | 100 | 单次死信再投递的最大批量 |
 
 存储为进程内内存结构：重启 Broker 会清空状态（`clientId` 的续传语义针对的是**断线重连**，不是 Broker 重启）。
 
@@ -148,6 +204,29 @@ curl -s -X POST localhost:8080/api/subscribe \
 curl -s 'localhost:8080/api/dead-letters?clientId=device-1'
 ```
 
+### 观察投递续期
+
+```bash
+# poll 拿到 messageId 后、ACK 超时到点前续期 30s（处理还没完）
+curl -s -X POST localhost:8080/api/subscriptions/device-1/heartbeat \
+  -H 'Content-Type: application/json' \
+  -d '{"messageId":"<messageId>","extendMs":30000}'
+# 响应含新的 deadlineAt；此前调度器不会把这条消息超时重投
+# 对同一条重复调用可继续续；ACK 之后再续期会得到 400 ALREADY_ACKED
+```
+
+### 观察死信再投递
+
+```bash
+# 先用小超时制造一条死信（见上一节），然后把它捞回来：
+curl -s -X POST localhost:8080/api/dead-letters/redrive \
+  -H 'Content-Type: application/json' \
+  -d '{"clientId":"device-1","messageIds":["<死信的messageId>"]}'
+# -> {"count":1,...}；再次 poll 能重新收到（deliveryAttempt=1），ACK 后彻底完成
+# 再查 /api/dead-letters?clientId=device-1：该条 redriven=true
+# 重复执行同一 redrive -> 400 NOT_DEAD_LETTERED，不会重复投递
+```
+
 ### 观察超时重投与死信
 
 用小超时启动，然后"poll 一次拿到消息但不 ACK、断开不再 poll"：
@@ -173,10 +252,15 @@ mvn spring-boot:run -Dspring-boot.run.arguments="--broker.max-pending-per-subscr
 mvn test
 ```
 
-控制台日志以 `场景一`～`场景五` 开头，直接标明覆盖的业务场景与每个用例的动作/结果：
+控制台日志以 `场景一`～`场景七` 开头，直接标明覆盖的业务场景与每个用例的动作/结果：
 
 - 场景一：主题过滤、非法订阅拒绝、未知订阅端报错
 - 场景二：断线重连续传、进度不回退、同主题 8 线程并发发布顺序稳定
 - 场景三：至少一次、超时重投、超上限进死信、重复/伪造/越权 ACK 全部明确报错
 - 场景四：dead-letter 与 drop-oldest 两种积压策略、慢订阅端不影响快订阅端
-- 场景五：完整 HTTP 端到端（真实调度器重投 → 死信）、冲突 409、畸形 JSON 400
+- 场景五：投递续期——续期后不误判超时、续期过期仍按原规则重投/进死信、续期≠确认、
+  五类非法续期明确报错、8 线程并发续期+扫描+发布互不干扰
+- 场景六：死信再投递——捞回后正常收到并 ACK、重复再投拒绝且不成倍、批量保序、
+  落回原序号位置不插队、整批原子拒绝、容量上限明确拒绝、4 线程并发再投同一批仅一次成功
+- 场景七：完整 HTTP 端到端（真实调度器重投 → 死信）、续期与再投递 REST 全流程、
+  冲突 409、畸形 JSON 400

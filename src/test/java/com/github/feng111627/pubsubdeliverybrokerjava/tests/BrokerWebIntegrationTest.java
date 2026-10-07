@@ -32,7 +32,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 @AutoConfigureMockMvc
 class BrokerWebIntegrationTest {
 
-    private static final Logger log = LoggerFactory.getLogger("场景五-HTTP端到端");
+    private static final Logger log = LoggerFactory.getLogger("场景七-HTTP端到端");
 
     @Autowired
     private MockMvc mvc;
@@ -181,6 +181,110 @@ class BrokerWebIntegrationTest {
                         .content("{not-json"))
                 .andExpect(status().isBadRequest())
                 .andExpect(r -> assertEquals("MALFORMED_REQUEST",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+    }
+
+    @Test
+    @DisplayName("投递续期：HTTP 续期后不被调度器重投；对已确认消息续期返回 400 ALREADY_ACKED")
+    void heartbeatOverHttp() throws Exception {
+        String cid = "web-hb";
+        log.info("[用例] 订阅->发布->poll->续期，等待超过原超时窗口后不应被重投");
+        mvc.perform(post("/api/subscribe").contentType("application/json")
+                .content("""
+                        {"clientId":"%s","filter":"hb"}""".formatted(cid))).andExpect(status().isOk());
+        String id = publishAndGetId("hb", "v");
+        mvc.perform(post("/api/subscriptions/{cid}/poll", cid)).andExpect(status().isOk());
+
+        // 原超时窗口 100ms；续 5s 后等 200ms，调度器不得把它重投
+        MvcResult hb = mvc.perform(post("/api/subscriptions/{cid}/heartbeat", cid)
+                        .contentType("application/json")
+                        .content("""
+                                {"messageId":"%s","extendMs":5000}""".formatted(id)))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode hbBody = json.readTree(hb.getResponse().getContentAsString());
+        assertEquals(id, hbBody.get("messageId").asText());
+        assertTrue(hbBody.get("deadlineAt").asLong() > System.currentTimeMillis());
+        Thread.sleep(200);
+        JsonNode batch = json.readTree(mvc.perform(post("/api/subscriptions/{cid}/poll", cid))
+                .andReturn().getResponse().getContentAsString());
+        assertEquals(1, batch.size());
+        assertFalse(batch.get(0).get("redelivery").asBoolean(), "续期后不得被误判超时重投");
+        assertEquals(1, batch.get(0).get("deliveryAttempt").asInt());
+
+        log.info("[用例] ACK 后再续期 -> 400 ALREADY_ACKED");
+        mvc.perform(post("/api/subscriptions/{cid}/ack", cid).contentType("application/json")
+                .content("""
+                        {"messageId":"%s"}""".formatted(id))).andExpect(status().isNoContent());
+        mvc.perform(post("/api/subscriptions/{cid}/heartbeat", cid)
+                        .contentType("application/json")
+                        .content("""
+                                {"messageId":"%s"}""".formatted(id)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("ALREADY_ACKED",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+
+        log.info("[用例] 对不存在消息续期 -> 400 MESSAGE_NOT_FOUND");
+        mvc.perform(post("/api/subscriptions/{cid}/heartbeat", cid)
+                        .contentType("application/json")
+                        .content("""
+                                {"messageId":"msg-nope"}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("MESSAGE_NOT_FOUND",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        log.info("[用例结果] 续期生效不重投；非法续期均明确报错");
+    }
+
+    @Test
+    @DisplayName("死信再投递：HTTP 捞回死信->正常收到并 ACK；台账可见 redriven；重复再投 400")
+    void redriveOverHttp() throws Exception {
+        String cid = "web-redrive";
+        log.info("[用例] 制造死信（小超时+不ACK），再投递后应能正常收到");
+        mvc.perform(post("/api/subscribe").contentType("application/json")
+                .content("""
+                        {"clientId":"%s","filter":"rd"}""".formatted(cid))).andExpect(status().isOk());
+        String id = publishAndGetId("rd", "back-from-dead");
+        mvc.perform(post("/api/subscriptions/{cid}/poll", cid)).andExpect(status().isOk());
+        Thread.sleep(400); // 等调度器把它超时送入死信（maxDeliveries=2, timeout=100ms）
+
+        JsonNode dead = json.readTree(mvc.perform(get("/api/dead-letters").param("clientId", cid))
+                .andReturn().getResponse().getContentAsString());
+        assertEquals(1, dead.size());
+        assertFalse(dead.get(0).get("redriven").asBoolean());
+
+        MvcResult rd = mvc.perform(post("/api/dead-letters/redrive")
+                        .contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["%s"]}""".formatted(cid, id)))
+                .andExpect(status().isOk()).andReturn();
+        JsonNode rdBody = json.readTree(rd.getResponse().getContentAsString());
+        assertEquals(1, rdBody.get("count").asInt());
+        assertEquals(id, rdBody.get("messageIds").get(0).asText());
+
+        JsonNode batch = json.readTree(mvc.perform(post("/api/subscriptions/{cid}/poll", cid))
+                .andReturn().getResponse().getContentAsString());
+        assertEquals(1, batch.size());
+        assertEquals(id, batch.get(0).get("messageId").asText());
+        mvc.perform(post("/api/subscriptions/{cid}/ack", cid).contentType("application/json")
+                .content("""
+                        {"messageId":"%s"}""".formatted(id))).andExpect(status().isNoContent());
+
+        JsonNode after = json.readTree(mvc.perform(get("/api/dead-letters").param("clientId", cid))
+                .andReturn().getResponse().getContentAsString());
+        assertTrue(after.get(0).get("redriven").asBoolean(), "台账必须能看出已再投");
+        log.info("[用例结果] 死信捞回->收到->ACK；台账 redriven=true");
+
+        log.info("[用例] 对已确认消息再投递 -> 400 ALREADY_ACKED；不存在消息 -> 400 MESSAGE_NOT_FOUND");
+        mvc.perform(post("/api/dead-letters/redrive").contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["%s"]}""".formatted(cid, id)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("ALREADY_ACKED",
+                        json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
+        mvc.perform(post("/api/dead-letters/redrive").contentType("application/json")
+                        .content("""
+                                {"clientId":"%s","messageIds":["msg-nope"]}""".formatted(cid)))
+                .andExpect(status().isBadRequest())
+                .andExpect(r -> assertEquals("MESSAGE_NOT_FOUND",
                         json.readTree(r.getResponse().getContentAsString()).get("errorCode").asText()));
     }
 
